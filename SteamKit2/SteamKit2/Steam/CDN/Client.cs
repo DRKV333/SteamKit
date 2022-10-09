@@ -87,7 +87,7 @@ namespace SteamKit2.CDN
                 url = $"depot/{depotId}/manifest/{manifestId}/{MANIFEST_VERSION}";
             }
 
-            var manifestData = await DoRawCommandAsync( server, url, proxyServer ).ConfigureAwait( false );
+            var manifestData = await DoRawCommandAsByteArrayAsync( server, url, proxyServer ).ConfigureAwait( false );
 
             manifestData = ZipUtil.Decompress( manifestData );
 
@@ -144,7 +144,7 @@ namespace SteamKit2.CDN
 
             var chunkID = Utils.EncodeHexString( chunk.ChunkID );
 
-            var chunkData = await DoRawCommandAsync( server, string.Format( "depot/{0}/chunk/{1}", depotId, chunkID ), proxyServer ).ConfigureAwait( false );
+            var chunkData = await DoRawCommandAsByteArrayAsync( server, string.Format( "depot/{0}/chunk/{1}", depotId, chunkID ), proxyServer ).ConfigureAwait( false );
 
             // assert that lengths match only if the chunk has a length assigned.
             if ( chunk.CompressedLength > 0 && chunkData.Length != chunk.CompressedLength )
@@ -163,7 +163,48 @@ namespace SteamKit2.CDN
             return depotChunk;
         }
 
-        async Task<byte[]> DoRawCommandAsync( Server server, string command, Server? proxyServer )
+        /// <summary>
+        /// Downloads the specified depot chunk.
+        /// </summary>
+        public Task DownloadDepotChunkRaw( uint depotId, DepotManifest.ChunkData chunk, Server server, Func<Stream, CancellationToken, Task> chunkHandler, Server? proxyServer = null )
+        {
+            if ( server == null )
+            {
+                throw new ArgumentNullException( nameof( server ) );
+            }
+
+            if ( chunk == null )
+            {
+                throw new ArgumentNullException( nameof( chunk ) );
+            }
+
+            if ( chunk.ChunkID == null )
+            {
+                throw new ArgumentException( "Chunk must have a ChunkID.", nameof( chunk ) );
+            }
+
+            return DoDownloadDepotChunkRaw( depotId, chunk, server, chunkHandler, proxyServer );
+        }
+
+        async Task DoDownloadDepotChunkRaw( uint depotId, DepotManifest.ChunkData chunk, Server server, Func<Stream, CancellationToken, Task> chunkHandler, Server? proxyServer = null )
+        {
+            var chunkID = Utils.EncodeHexString( chunk.ChunkID! );
+
+            await DoRawCommandAsync( server, string.Format( "depot/{0}/chunk/{1}", depotId, chunkID ), proxyServer, async (content, ct) =>
+            {
+                long? length = content.Headers.ContentLength;
+                if ( length.HasValue && chunk.CompressedLength > 0 && length.Value != chunk.CompressedLength )
+                {
+                    throw new InvalidDataException( $"Length mismatch after downloading depot chunk! (was {length}, but should be {chunk.CompressedLength})" );
+                }
+
+                await chunkHandler( await content.ReadAsStreamAsync(), ct );
+
+                return true;
+            } ).ConfigureAwait( false );
+        }
+
+        async Task<T> DoRawCommandAsync<T>( Server server, string command, Server? proxyServer, Func<HttpContent, CancellationToken, Task<T>> contentHandler )
         {
             var url = BuildCommand( server, command, proxyServer );
             using var request = new HttpRequestMessage( HttpMethod.Get, url );
@@ -182,18 +223,9 @@ namespace SteamKit2.CDN
 
                 cts.CancelAfter( ResponseBodyTimeout );
 
-#if NET5_0_OR_GREATER
-                return await response.Content.ReadAsByteArrayAsync( cts.Token ).ConfigureAwait( false );
-#else
-                var contentLength = response.Content.Headers.ContentLength;
+                return await contentHandler( response.Content, cts.Token ).ConfigureAwait( false );
 
-                using var responseStream = await response.Content.ReadAsStreamAsync().ConfigureAwait( false );
-                using var ms = new MemoryStream( ( int )contentLength.GetValueOrDefault() );
 
-                await responseStream.CopyToAsync( ms, 81920, cts.Token ).ConfigureAwait( false );
-
-                return ms.ToArray();
-#endif
             }
             catch ( Exception ex )
             {
@@ -201,6 +233,23 @@ namespace SteamKit2.CDN
                 throw;
             }
         }
+
+        Task<byte[]> DoRawCommandAsByteArrayAsync( Server server, string command, Server? proxyServer ) =>
+            DoRawCommandAsync( server, command, proxyServer, async (content, ct) =>
+            {
+#if NET5_0_OR_GREATER
+                return await content.ReadAsByteArrayAsync( ct ).ConfigureAwait( false );
+#else
+                var contentLength = content.Headers.ContentLength;
+
+                using var responseStream = await content.ReadAsStreamAsync().ConfigureAwait( false );
+                using var ms = new MemoryStream( ( int )contentLength.GetValueOrDefault() );
+
+                await responseStream.CopyToAsync( ms, 81920, ct ).ConfigureAwait( false );
+
+                return ms.ToArray();
+#endif
+            } );
 
         static Uri BuildCommand( Server server, string command, Server? proxyServer )
         {
